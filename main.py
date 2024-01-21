@@ -1,3 +1,4 @@
+import os
 import time
 
 import torchvision.transforms as transforms
@@ -15,8 +16,17 @@ import copy
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+# torch.backends.quantized.engine = 'fbgemm'
+# torch.backends.quantized.engine = 'qnnpack' # for mac
+# os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1' # for mac
+
 # device = torch.device("cpu")
 print(f"Using device: {device}.")
+
+input_shape = (3, 52, 64)  # Adjust as per your requirements
+outputs_number = 262  # Number of output classes
+# Initialize the model, optimizer, and loss function
+lr = 0.00025  # Learning rate
 
 
 class FirstModel(nn.Module):
@@ -63,9 +73,9 @@ class FirstModel(nn.Module):
 class SecondModel(nn.Module):
     def __init__(self, input_shape, outputs_number):
         super(SecondModel, self).__init__()
-        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=3, padding='same')
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding='same')
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding='same')
+        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=3, padding=(1, 1))
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=(1, 1))
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=(1, 1))
         self.pool = nn.MaxPool2d(2, 2)
         self.flatten = nn.Flatten()
 
@@ -97,11 +107,11 @@ class SecondModel(nn.Module):
 class ThirdModel(nn.Module):
     def __init__(self, input_shape, outputs_number):
         super(ThirdModel, self).__init__()
-        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=3, padding='same')
+        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=3, padding=(1, 1))
         self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding='same')
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=(1, 1))
         self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding='same')
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=(1, 1))
         self.bn3 = nn.BatchNorm2d(128)
         self.pool = nn.MaxPool2d(2, 2)
         self.flatten = nn.Flatten()
@@ -136,6 +146,7 @@ def get_pytorch_model(input_shape, outputs_number, lr):
     loss_function = nn.CrossEntropyLoss()
     return model, optimizer, loss_function
 
+model, optimizer, loss_function = get_pytorch_model(input_shape, outputs_number, lr)
 
 def evaluate_accuracy(model, data_loader):
     model.eval()
@@ -151,37 +162,79 @@ def evaluate_accuracy(model, data_loader):
 
     return round(100 * correct / total, 2)
 
+
+def top_n_accuracy(model, data_loader, n=3):
+    model.to(device)
+    model.eval()
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in data_loader:
+            images, labels = images.to(device), labels.to(device)
+
+            outputs = model(images)
+            _, top3_indices = torch.topk(outputs, n, dim=1)
+            top3_indices = top3_indices.cpu().numpy()
+            labels = labels.cpu().numpy()
+
+            for idx, label in enumerate(labels):
+                if label in top3_indices[idx]:
+                    correct += 1
+            total += labels.shape[0]
+
+
+    return round(100 * correct / total, 2)
+
+def evaluate_or_train_loss(model, data_loader, loss_function, optimizer=None, train=False):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    total_count = 0
+
+    with torch.set_grad_enabled(train):
+        for inputs, labels in data_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = loss_function(outputs, labels)
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * inputs.size(0)
+            total_count += inputs.size(0)
+
+    return round(100 * total_loss / total_count, 2)
+
 def train_model(model, train_loader, val_loader, optimizer, loss_function, epochs=10, model_path='model_epoch_'):
     model = model.to(device)
 
     for epoch in range(epochs):
         start_time = time.perf_counter()
 
-        model.train()
-        running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        # Trening modelu i obliczanie średniej straty na zbiorze treningowym
+        train_loss = evaluate_or_train_loss(model, train_loader, loss_function, optimizer, train=True)
 
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-
-        # Validation
+        # Ewaluacja modelu i obliczanie średniej straty na zbiorze walidacyjnym
+        val_loss = evaluate_or_train_loss(model, val_loader, loss_function, train=False)
         accuracy = evaluate_accuracy(model, val_loader)
 
         end_time = time.perf_counter()
         duration = end_time - start_time
 
         print(
-            f"Epoch {epoch + 1}/{epochs} took {round(duration, 2)}s, Loss: {round(running_loss / len(train_loader), 2)} Accuracy: {accuracy}%")
+            f"Epoch {epoch + 1}/{epochs} took {round(duration, 2)}s, Training Loss: {round(train_loss, 2)}, Validation Loss: {round(val_loss, 2)}, Accuracy: {accuracy}%")
 
-        # Save the model after each epoch
-        model.train()
-        epoch_model_path = f"models/{model_path}{epoch + 1}.pth"
+        # Zapisanie modelu po każdej epoce
+        epoch_model_path = f"models/{model_path}-{epoch + 1}.pth"
         torch.save(model.state_dict(), epoch_model_path)
+
 
 
 def get_dataset():
@@ -213,30 +266,20 @@ def get_dataset():
 
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    val_loader_with_reduced_batch_size = DataLoader(val_dataset, batch_size=8, shuffle=False, pin_memory=False)
 
-    return train_loader, val_loader, classes
-
-
-train_loader, val_loader, classes = get_dataset()
-
-# Initialize the model, optimizer, and loss function
-input_shape = (3, 52, 64)  # Adjust as per your requirements
-outputs_number = 262  # Number of output classes
-lr = 0.00025  # Learning rate
-model, optimizer, loss_function = get_pytorch_model(input_shape, outputs_number, lr)
+    return train_loader, val_loader, classes, val_loader_with_reduced_batch_size
 
 def start_training(model_name):
     # Train the model
     start_time = time.perf_counter()
     print("Start training.")
-    train_model(model, train_loader, val_loader, optimizer, loss_function, epochs=150, model_path=model_name)
+    train_model(model, train_loader, val_loader, optimizer, loss_function, epochs=250, model_path=model_name)
     end_time = time.perf_counter()
     duration = end_time - start_time
     print(f"The training took {duration} seconds to execute.")
     # Save the model
     torch.save(model.state_dict(), f'models/{model_name}.pth')
-
-start_training("model3")
 
 #### LOAD MODEL ####
 def load_model(path):
@@ -245,7 +288,14 @@ def load_model(path):
     loaded_model = loaded_model.to(device)
     return loaded_model
 
-# loaded_model = load_model("models/model2.pth")
+def analyze_model(model, train_loader, val_loader, name=""):
+    # Ocena dokładności i straty
+    train_accuracy = evaluate_accuracy(model, train_loader)
+    val_accuracy = evaluate_accuracy(model, val_loader)
+    val_loss = evaluate_or_train_loss(model, val_loader, loss_function)
+
+    print(
+        f"{name} Train Acc: {train_accuracy}, Val Acc: {val_accuracy}, Val Loss: {val_loss}")
 def conf_matrix(loaded_model, val_loader):
     def get_all_preds(model, loader):
         all_preds = torch.tensor([]).to(device)
@@ -280,12 +330,6 @@ def find_most_confused_labels(loaded_model, val_loader, classes):
 
     return confused_labels
 
-# # Assuming conf_mat is your confusion matrix and classes is a list of class names
-# most_confused = find_most_confused_labels(loaded_model, val_loader, classes)
-
-# print("Most confused label pairs:", most_confused)
-
-
 #### OPTYMALIZACJA SIECI ####
 def apply_pruning(model):
     # Przycinanie warstw konwolucyjnych
@@ -297,14 +341,20 @@ def apply_pruning(model):
     prune.l1_unstructured(model.fc1, name='weight', amount=0.1)
     prune.l1_unstructured(model.fc2, name='weight', amount=0.1)
 
+    # Make pruning permanent
+    for module in model.modules():
+        if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
+            prune.remove(module, 'weight')
+
     return model
 
 
 def apply_quantization(model, data_loader):
-    model.eval()
+    model.to("cpu").eval()
 
     # Ustawienie konfiguracji kwantyzacji
     model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+    # model.qconfig = torch.quantization.get_default_qconfig('qnnpack') # for mac
 
     # Przygotowanie modelu do kwantyzacji
     torch.quantization.prepare(model, inplace=True)
@@ -312,29 +362,67 @@ def apply_quantization(model, data_loader):
     # Kalibracja modelu
     with torch.no_grad():
         for inputs, _ in data_loader:
-            model(inputs.to(device))
+            model(inputs.to('cpu'))
 
     # Konwersja modelu do kwantyzowanej wersji
     torch.quantization.convert(model, inplace=True)
 
     return model
 
+def evaluate_inference_time(model, data_loader, name=""):
+    model.eval()
+    total_time = 0.0
+    total_count = 0
 
-# # Ocena dokładności pierwotnego modelu
-# original_accuracy = evaluate_accuracy(loaded_model, val_loader)
-# print(f"Original Model Accuracy: {original_accuracy}%")
-#
-# # Pruning
+    with torch.no_grad():
+        for inputs, _ in data_loader:
+            inputs = inputs.to(device)
+            start_time = time.time()
+            _ = model(inputs)
+            total_time += time.time() - start_time
+            total_count += inputs.size(0)
+
+    average_inference_time = total_time / total_count
+    print(f"Average inference time for model {name}: {round(average_inference_time, 6)} s/record")
+
+    return average_inference_time
+
+train_loader, val_loader, classes, val_loader_with_reduced_batch_size = get_dataset()
+
+# start_training("model3v2")
+
+model_name = "model3v2"
+loaded_model = load_model(f"models/{model_name}.pth")
+
+# Assuming conf_mat is your confusion matrix and classes is a list of class names
+most_confused = find_most_confused_labels(loaded_model, val_loader, classes)
+
+print("Most confused label pairs:", most_confused)
+
+# Ocena dokładności pierwotnego modelu
+# analyze_model(model=loaded_model, train_loader=train_loader, val_loader=val_loader, name="Original")
+# evaluate_inference_time(loaded_model, val_loader, name="Original")
+top_3_accuracy = top_n_accuracy(loaded_model, val_loader, 3)
+top_4_accuracy = top_n_accuracy(loaded_model, val_loader, 4)
+top_5_accuracy = top_n_accuracy(loaded_model, val_loader, 5)
+print(f"Top-3 Accuracy: {top_3_accuracy}")
+print(f"Top-4 Accuracy: {top_4_accuracy}")
+print(f"Top-5 Accuracy: {top_5_accuracy}")
+
+# Pruning
 # model_pruned = copy.deepcopy(loaded_model)
 # apply_pruning(model_pruned)
-# pruned_accuracy = evaluate_accuracy(model_pruned, val_loader)
-# print(f"Pruned Model Accuracy: {pruned_accuracy}%")
-#
+# analyze_model(model=model_pruned, train_loader=train_loader, val_loader=val_loader, name="Pruned")
+# # evaluate_inference_time(model_pruned, val_loader, name="Pruned")
+# torch.save(model_pruned.state_dict(), f"models/{model_name}-pruned2.pth")
+
 # # Kwantyzacja
 # model_quantized = copy.deepcopy(loaded_model)
-# apply_quantization(model_quantized, val_loader)
-# quantized_accuracy = evaluate_accuracy(model_quantized, val_loader)
-# print(f"Quantized Model Accuracy: {quantized_accuracy}%")
+# apply_quantization(model_quantized, val_loader_with_reduced_batch_size)
+# analyze_model(model=model_quantized, train_loader=train_loader, val_loader=val_loader, name="Quantized")
+# evaluate_inference_time(model_quantized, val_loader, name="Quantized")
+# torch.save(model_pruned.state_dict(), f"models/{model_name}-quantized.pth")
+
 #
 # # Pruning i Kwantyzacja
 # model_pruned_quantized = copy.deepcopy(loaded_model)
