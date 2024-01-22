@@ -139,6 +139,40 @@ class ThirdModel(nn.Module):
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
 
+class PrunedThirdModel(nn.Module):
+    def __init__(self, input_shape, outputs_number):
+        super(PrunedThirdModel, self).__init__()
+        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=3, padding=(1, 1))
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=(1, 1))
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=(1, 1))
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.flatten = nn.Flatten()
+
+        self._to_linear = None
+        self.convs(torch.zeros(1, *input_shape))
+
+        self.fc1 = nn.Linear(self._to_linear, 512)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(512, outputs_number)
+
+    def convs(self, x):
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        if self._to_linear is None:
+            self._to_linear = x[0].numel()
+        return x
+
+    def forward(self, x):
+        x = self.convs(x)
+        x = self.flatten(x)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
 
 def get_pytorch_model(input_shape, outputs_number, lr):
     model = ThirdModel(input_shape, outputs_number).to(device)
@@ -266,9 +300,10 @@ def get_dataset():
 
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    val_loader_with_reduced_batch_size = DataLoader(val_dataset, batch_size=8, shuffle=False, pin_memory=False)
+    train_loader_with_reduced_batch_size = DataLoader(val_dataset, batch_size=29, shuffle=False, pin_memory=False)
+    val_loader_with_reduced_batch_size = DataLoader(val_dataset, batch_size=29, shuffle=False, pin_memory=False)
 
-    return train_loader, val_loader, classes, val_loader_with_reduced_batch_size
+    return train_loader, val_loader, classes, train_loader_with_reduced_batch_size, val_loader_with_reduced_batch_size
 
 def start_training(model_name):
     # Train the model
@@ -290,7 +325,8 @@ def load_model(path):
 
 def analyze_model(model, train_loader, val_loader, name=""):
     # Ocena dokładności i straty
-    train_accuracy = evaluate_accuracy(model, train_loader)
+    # train_accuracy = evaluate_accuracy(model, train_loader)
+    train_accuracy = 0
     val_accuracy = evaluate_accuracy(model, val_loader)
     val_loss = evaluate_or_train_loss(model, val_loader, loss_function)
 
@@ -331,23 +367,94 @@ def find_most_confused_labels(loaded_model, val_loader, classes):
     return confused_labels
 
 #### OPTYMALIZACJA SIECI ####
+import torch
+import torch.nn.utils.prune as prune
+import torch.nn as nn
+
+
+def prune_neurons(layer, threshold=1e-6):
+    # Znajdowanie neuronów z wagami bliskimi zeru
+    neuron_indices = torch.sum((layer.weight.data.abs() > threshold), dim=1) > 0
+
+    # Tworzenie nowej warstwy z pominięciem wybranych neuronów
+    new_layer = nn.Linear(in_features=layer.in_features,
+                          out_features=torch.sum(neuron_indices),
+                          bias=layer.bias is not None)
+
+    # Kopiowanie danych do nowej warstwy
+    new_layer.weight.data = layer.weight.data[neuron_indices, :]
+    if layer.bias is not None:
+        new_layer.bias.data = layer.bias.data[neuron_indices]
+
+    return new_layer
+
+
 def apply_pruning(model):
-    # Przycinanie warstw konwolucyjnych
-    prune.l1_unstructured(model.conv1, name='weight', amount=0.1)
+    # Przycinanie warstw konwolucyjnych i liniowych
+    prune.l1_unstructured(model.conv1, name='weight', amount=0.10)
     prune.l1_unstructured(model.conv2, name='weight', amount=0.15)
-    prune.l1_unstructured(model.conv3, name='weight', amount=0.2)
+    prune.l1_unstructured(model.conv3, name='weight', amount=0.20)
+    prune.l1_unstructured(model.fc1, name='weight', amount=0.15)
+    prune.l1_unstructured(model.fc2, name='weight', amount=0.15)
+
+    # Utrwalanie przycięcia
+    for name, module in model.named_children():
+        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+            prune.remove(module, 'weight')
+            if isinstance(module, nn.Linear):
+                new_module = prune_neurons(module)
+                setattr(model, name, new_module)  # Aktualizacja modelu
+
+    return model
+
+def apply_structured_pruning(model):
+    # Przycinanie warstw konwolucyjnych
+    prune.ln_structured(model.conv1, name='weight', amount=0.1, n=2, dim=0)
+    prune.ln_structured(model.conv2, name='weight', amount=0.15, n=2, dim=0)
+    prune.ln_structured(model.conv3, name='weight', amount=0.2, n=2, dim=0)
 
     # Przycinanie warstw liniowych
-    prune.l1_unstructured(model.fc1, name='weight', amount=0.1)
-    prune.l1_unstructured(model.fc2, name='weight', amount=0.1)
+    prune.ln_structured(model.fc1, name='weight', amount=0.1, n=1, dim=0)
+    prune.ln_structured(model.fc2, name='weight', amount=0.1, n=1, dim=0)
 
-    # Make pruning permanent
+    # Utrwalanie przycięcia
     for module in model.modules():
-        if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
+        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
             prune.remove(module, 'weight')
 
     return model
 
+
+def hard_prune_model(model, threshold=1e-6):
+    for name, module in list(model.named_children()):
+        # Dla warstw liniowych
+        if isinstance(module, nn.Linear):
+            # Znajdź neurony do zachowania
+            to_keep = [i for i in range(module.weight.data.size(0)) if not torch.all(module.weight.data[i].abs() < threshold)]
+            # Utwórz nową warstwę i zaktualizuj model
+            if len(to_keep) < module.weight.data.size(0):
+                new_layer = nn.Linear(in_features=module.in_features, out_features=len(to_keep), bias=module.bias is not None)
+                new_layer.weight.data = module.weight.data[to_keep, :]
+                if module.bias is not None:
+                    new_layer.bias.data = module.bias.data[to_keep]
+                setattr(model, name, new_layer)
+
+        # Dla warstw konwolucyjnych
+        elif isinstance(module, nn.Conv2d):
+            # Znajdź kanały do zachowania
+            to_keep = [i for i in range(module.weight.data.size(0)) if not torch.all(module.weight.data[i].abs() < threshold)]
+            # Utwórz nową warstwę i zaktualizuj model
+            if len(to_keep) < module.weight.data.size(0):
+                new_layer = nn.Conv2d(in_channels=module.in_channels, out_channels=len(to_keep), kernel_size=module.kernel_size, stride=module.stride, padding=module.padding, bias=module.bias is not None)
+                new_layer.weight.data = module.weight.data[to_keep, :, :, :]
+                if module.bias is not None:
+                    new_layer.bias.data = module.bias.data[to_keep]
+                setattr(model, name, new_layer)
+
+        # Rekurencyjne przycinanie dla modułów zagnieżdżonych
+        hard_prune_model(module)
+
+    return model
 
 def apply_quantization(model, data_loader):
     model.to("cpu").eval()
@@ -370,13 +477,13 @@ def apply_quantization(model, data_loader):
     return model
 
 def evaluate_inference_time(model, data_loader, name=""):
-    model.eval()
+    model.to("cpu").eval()
     total_time = 0.0
     total_count = 0
 
     with torch.no_grad():
         for inputs, _ in data_loader:
-            inputs = inputs.to(device)
+            inputs = inputs.to("cpu")
             start_time = time.time()
             _ = model(inputs)
             total_time += time.time() - start_time
@@ -387,34 +494,66 @@ def evaluate_inference_time(model, data_loader, name=""):
 
     return average_inference_time
 
-train_loader, val_loader, classes, val_loader_with_reduced_batch_size = get_dataset()
+def count_active_weights(model):
+    active_weights = 0
+    for w in model.parameters():
+        if w.requires_grad:
+            nonzero_weights = torch.count_nonzero(w.data)
+            active_weights += nonzero_weights
+            # print(f"Nonzero weights in layer: {nonzero_weights}")
+    return active_weights
+
+
+def count_total_weights(model):
+    total_weights = 0
+    for param in model.parameters():
+        if param.requires_grad:
+            total_weights += param.numel()  # numel zwraca liczbę elementów w tensorze
+    return total_weights
+
+train_loader, val_loader, classes, train_loader_with_reduced_batch_size, val_loader_with_reduced_batch_size = get_dataset()
 
 # start_training("model3v2")
 
 model_name = "model3v2"
 loaded_model = load_model(f"models/{model_name}.pth")
 
-# Assuming conf_mat is your confusion matrix and classes is a list of class names
-most_confused = find_most_confused_labels(loaded_model, val_loader, classes)
-
-print("Most confused label pairs:", most_confused)
+# most_confused = find_most_confused_labels(loaded_model, val_loader, classes)
+# print("Most confused label pairs:", most_confused)
 
 # Ocena dokładności pierwotnego modelu
-# analyze_model(model=loaded_model, train_loader=train_loader, val_loader=val_loader, name="Original")
-# evaluate_inference_time(loaded_model, val_loader, name="Original")
+analyze_model(model=loaded_model, train_loader=train_loader, val_loader=val_loader, name="Original")
+evaluate_inference_time(loaded_model, val_loader, name="Original")
+top_2_accuracy = top_n_accuracy(loaded_model, val_loader, 2)
+print(f"Top-2 Accuracy: {top_2_accuracy}")
 top_3_accuracy = top_n_accuracy(loaded_model, val_loader, 3)
-top_4_accuracy = top_n_accuracy(loaded_model, val_loader, 4)
-top_5_accuracy = top_n_accuracy(loaded_model, val_loader, 5)
 print(f"Top-3 Accuracy: {top_3_accuracy}")
+top_4_accuracy = top_n_accuracy(loaded_model, val_loader, 4)
 print(f"Top-4 Accuracy: {top_4_accuracy}")
+top_5_accuracy = top_n_accuracy(loaded_model, val_loader, 5)
 print(f"Top-5 Accuracy: {top_5_accuracy}")
+print(f"Liczba wszystkich wag przed przycięciem: {count_total_weights(loaded_model)}")
+print(f"Liczba aktywnych wag przed przycięciem: {count_active_weights(loaded_model)}")
+
 
 # Pruning
-# model_pruned = copy.deepcopy(loaded_model)
-# apply_pruning(model_pruned)
-# analyze_model(model=model_pruned, train_loader=train_loader, val_loader=val_loader, name="Pruned")
-# # evaluate_inference_time(model_pruned, val_loader, name="Pruned")
-# torch.save(model_pruned.state_dict(), f"models/{model_name}-pruned2.pth")
+model_pruned = copy.deepcopy(loaded_model)
+model_pruned = apply_pruning(model_pruned)
+analyze_model(model=model_pruned, train_loader=train_loader, val_loader=val_loader, name="Pruned")
+top_2_accuracy = top_n_accuracy(model_pruned, val_loader, 2)
+print(f"Top-2 Accuracy: {top_2_accuracy}")
+top_3_accuracy = top_n_accuracy(model_pruned, val_loader, 3)
+print(f"Top-3 Accuracy: {top_3_accuracy}")
+top_4_accuracy = top_n_accuracy(model_pruned, val_loader, 4)
+print(f"Top-4 Accuracy: {top_4_accuracy}")
+top_5_accuracy = top_n_accuracy(model_pruned, val_loader, 5)
+print(f"Top-5 Accuracy: {top_5_accuracy}")
+evaluate_inference_time(model_pruned, val_loader, name="Pruned")
+model_pruned = apply_structured_pruning(model_pruned)
+model_pruned = hard_prune_model(model_pruned)
+print(f"Liczba wszystkich wag po przycięciu: {count_total_weights(model_pruned)}")
+print(f"Liczba aktywnych wag po przycięciu: {count_active_weights(model_pruned)}")
+torch.save(model_pruned.state_dict(), f"models/{model_name}-pruned-hard-123.pth")
 
 # # Kwantyzacja
 # model_quantized = copy.deepcopy(loaded_model)
